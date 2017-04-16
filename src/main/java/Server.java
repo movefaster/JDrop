@@ -13,6 +13,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Random;
 import java.util.Scanner;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -22,9 +23,9 @@ import java.util.regex.Pattern;
  * The {@code Server} class is both the server and the client for JDrop. By default, it listens to incoming connections
  * from other JDrop clients and sends text or file to other JDrop clients through port 10001.
  * The protocol for transmitting over a socket is as follows:
- * [6-bit code] [type (either "FILE" or "TEXT")]
- * If "FILE" type: [filename]\n[file size]\n[payload]
- * If "TEXT" type: [payload]\n
+ * [6-bit code]\0[type (either "FILE" or "TEXT")]\0
+ * If "FILE" type: [filename]\0[file size]\0[payload]
+ * If "TEXT" type: [payload]\0
  */
 public class Server {
     public static final int DEFAULT_PORT = 10001;
@@ -36,12 +37,15 @@ public class Server {
     private Random random;
     private StringProperty code;
     private Consumer<Throwable> onErrorListener;
+    private ReentrantLock lock;
 
     public Server(final Consumer<Throwable> onErrorListener) {
         this.onErrorListener = onErrorListener;
         random = new Random();
         code = new SimpleStringProperty();
         renewCode();
+
+        lock = new ReentrantLock();
 
         new Thread(() -> {
             while (true) {
@@ -63,26 +67,23 @@ public class Server {
         try {
             InputStream inputStream = socket.getInputStream();
             OutputStream outputStream = socket.getOutputStream();
-            Scanner in = new Scanner(inputStream);
-            String code = in.next();
+            String code = readToken(inputStream);
             if (!code.equals(this.code.get())) {
                 LOG.log(Level.INFO, "Code mismatch. Disconnecting.");
                 disconnect(socket);
-                in.close();
                 return;
             }
-            String type = in.next();
+            String type = readToken(inputStream);
             switch (type) {
                 case "FILE":
-                    acceptFile(in, inputStream);
+                    acceptFile(inputStream);
                     break;
                 case "TEXT":
-                    readText(in);
+                    readText(inputStream);
                     break;
                 default:
                     LOG.log(Level.WARNING, "Unrecognized type: " + type + ". Disconnecting.");
                     disconnect(socket);
-                    in.close();
                     break;
             }
         } catch (IOException e) {
@@ -90,25 +91,33 @@ public class Server {
         }
     }
 
-    private void acceptFile(Scanner in, InputStream stream) {
-        String filename = in.nextLine().trim();
-        long size = in.nextLong();
-        final File[] temp = new File[1];
-//        try {
-//            temp = File.createTempFile("JDrop", ".tmp");
-//            long counter = 0;
-//            byte[] buffer = new byte[DEFAULT_CHUNK];
-//            FileOutputStream out = new FileOutputStream(temp);
-//            while (stream.available() > 0) {
-//                int numBytes = stream.read(buffer);
-//                counter += numBytes;
-//                out.write(buffer, 0, numBytes);
-//            }
-//            LOG.log(Level.INFO, "Written " + counter + " bytes to " + temp.getAbsolutePath());
-//        } catch (IOException e) {
-//            onErrorListener.accept(e);
-//            return;
-//        }
+    /**
+     * Read null-terminated stream of bytes and return the next token. The {@code InputStream} must be positioned before
+     * the first byte. <em>Importantly, this method does not buffer so after read the {@code InputStream} is
+     * positioned at the null character (so the next token can be read).</em>
+     * @param in the {@code InputStream} to read token from
+     * @return the next token in the stream
+     */
+    private String readToken(InputStream in) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int buffer = 0;
+        try {
+            while (in.available() > 0) {
+                buffer = in.read();
+                if (buffer == 0) break;
+                out.write(buffer);
+            }
+            out.close();
+            return out.toString();
+        } catch (IOException e) {
+            onErrorListener.accept(e);
+        }
+        return "";
+    }
+
+    private void acceptFile(InputStream stream) {
+        String filename = readToken(stream);
+        long size = Long.parseLong(readToken(stream));
 
         Platform.runLater(() -> {
             new AlertBuilder(Alert.AlertType.CONFIRMATION)
@@ -122,18 +131,6 @@ public class Server {
                                 .setFilename(filename)
                                 .showSaveDialog(null);
                         if (file != null) {
-//                            try {
-//                                Files.move(temp[0].toPath(), file.toPath(),
-//                                        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-//                            } catch (AtomicMoveNotSupportedException e) {
-//                                try {
-//                                    Files.move(temp[0].toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
-//                                } catch (IOException e1) {
-//                                    onErrorListener.accept(e1);
-//                                }
-//                            } catch (IOException e) {
-//                                onErrorListener.accept(e);
-//                            }
                             readFile(file, stream, size);
                         }
                     }).showAndWait();
@@ -196,7 +193,6 @@ public class Server {
                             file.getAbsolutePath(), (System.nanoTime() - time) / 1e9))
                     .showAndWait();
             try {
-
                 stream.close();
             } catch (IOException e) {
                 onErrorListener.accept(e);
@@ -213,12 +209,10 @@ public class Server {
         return String.format("%.1f %sB", bytes / Math.pow(unit, exp), pre);
     }
 
-    private void readText(Scanner in) {
-        Pattern delimiter = in.delimiter();
-        in.useDelimiter("\\z");
-        String text = in.next();
-        displayText(text);
-        in.useDelimiter(delimiter);
+    private void readText(InputStream in) {
+        Scanner s = new Scanner(in);
+        s.useDelimiter("\\z");
+        displayText(s.next());
     }
 
     private void displayText(String text) {
@@ -260,7 +254,7 @@ public class Server {
             LOG.log(Level.INFO, "Connecting to " + host + ":" + DEFAULT_PORT);
             socket = new Socket(host, DEFAULT_PORT);
             OutputStream out = socket.getOutputStream();
-            byte[] msg = String.format("%s FILE %s\n%d\n", code, file.getName(), file.length()).getBytes();
+            byte[] msg = String.format("%s\0FILE\0%s\0%d\0", code, file.getName(), file.length()).getBytes();
             out.write(msg);
             long numBytes = writeFile(in, out);
             LOG.log(Level.INFO, "Written " + numBytes + " bytes to socket OutputStream");
@@ -276,7 +270,6 @@ public class Server {
         long counter = 0;
         byte[] buffer = new byte[DEFAULT_CHUNK];
         try {
-            out.write(buffer, 0, DEFAULT_CHUNK);
             while (in.available() > 0) {
                 int numBytes = in.read(buffer);
                 counter += numBytes;
