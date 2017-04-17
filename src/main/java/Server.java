@@ -1,3 +1,19 @@
+/*
+ * Copyright [2017] [Morton Mo]
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 import javafx.application.Platform;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.beans.property.StringProperty;
@@ -6,7 +22,6 @@ import javafx.geometry.Insets;
 import javafx.scene.control.Alert;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.layout.GridPane;
-
 
 import java.io.*;
 import java.net.ServerSocket;
@@ -17,15 +32,16 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import java.util.regex.Pattern;
 
 /**
  * The {@code Server} class is both the server and the client for JDrop. By default, it listens to incoming connections
  * from other JDrop clients and sends text or file to other JDrop clients through port 10001.
  * The protocol for transmitting over a socket is as follows:
- * [6-bit code]\0[type (either "FILE" or "TEXT")]\0
- * If "FILE" type: [filename]\0[file size]\0[payload]
- * If "TEXT" type: [payload]\0
+ * <pre>{@code
+ *     [6-bit code]\0[type (either "FILE" or "TEXT")]\0
+ *      If "FILE" type: [filename]\0[file size]\0[payload]
+ *      If "TEXT" type: [payload]\0}
+ * </pre>
  */
 public class Server {
     public static final int DEFAULT_PORT = 10001;
@@ -38,7 +54,14 @@ public class Server {
     private StringProperty code;
     private Consumer<Throwable> onErrorListener;
     private ReentrantLock lock;
+    private Thread serverThread;
 
+    /**
+     * Construct a new {@code Server} instance with a given error listener. All exceptions are routed to this listener
+     * for handling. This method instantiates the {@link ServerSocket} instance to accept connection from remote hosts
+     * in a separate thread.
+     * @param onErrorListener a {@link Consumer<Throwable>} instance to consume exceptions in server.
+     */
     public Server(final Consumer<Throwable> onErrorListener) {
         this.onErrorListener = onErrorListener;
         random = new Random();
@@ -47,7 +70,7 @@ public class Server {
 
         lock = new ReentrantLock();
 
-        new Thread(() -> {
+        serverThread = new Thread(() -> {
             while (true) {
                 try {
                     serverSocket = new ServerSocket(DEFAULT_PORT);
@@ -58,9 +81,19 @@ public class Server {
                     onErrorListener.accept(e);
                 }
             }
-        }).start();
+        });
+        serverThread.start();
     }
 
+    /**
+     * Process an incoming connection request according to the transport protocol. This includes:
+     * <ol>
+     *     <li>Verify code</li>
+     *     <li>Determine whether text or file is being sent</li>
+     *     <li>Accept text/file and display/save it</li>
+     * </ol>
+     * @param socket the socket attached to the {@link ServerSocket} instance to read from
+     */
     private void accept(Socket socket) {
         LOG.log(Level.INFO, String.format("Received incoming connection from %s:%d through local port %d",
                 socket.getInetAddress(), socket.getPort(), socket.getLocalPort()));
@@ -115,6 +148,10 @@ public class Server {
         return "";
     }
 
+    /**
+     * Helper method to accept a byte stream of a file.
+     * @param stream the stream to read the bytes
+     */
     private void acceptFile(InputStream stream) {
         String filename = readToken(stream);
         long size = Long.parseLong(readToken(stream));
@@ -137,6 +174,13 @@ public class Server {
         });
     }
 
+    /**
+     * Helper method to save file to local filesystem. It also displays a progress bar dialog window to notify the
+     * progress of the transfer. <em>Note that the file is saved asynchronously.</em>
+     * @param file the file (selected by user) to save to
+     * @param stream the stream to read the file from
+     * @param size the size (in bytes) of the file
+     */
     private void readFile(final File file, InputStream stream, long size) {
         Task<Long> writeFileTask = new Task<Long>() {
             @Override
@@ -169,8 +213,7 @@ public class Server {
         grid.setMaxWidth(Double.MAX_VALUE);
 
         ProgressBar progressBar = new ProgressBar(0);
-        progressBar.setMaxWidth(Double.MAX_VALUE);
-        progressBar.setPrefWidth(grid.getWidth());
+        progressBar.prefWidthProperty().bind(grid.widthProperty().subtract(20));
         grid.add(progressBar, 0, 0);
 
         Alert progressAlert = new AlertBuilder(Alert.AlertType.INFORMATION)
@@ -186,7 +229,7 @@ public class Server {
         new Thread(writeFileTask).start();
 
         writeFileTask.setOnSucceeded(v -> {
-//            progressAlert.close();
+            progressAlert.close();
             new AlertBuilder(Alert.AlertType.INFORMATION)
                     .setTitle("Complete")
                     .setMessage(String.format("File has been saved to %s.\nTime: %6.3f seconds",
@@ -201,6 +244,14 @@ public class Server {
         });
     }
 
+    /**
+     * Convert the number of bytes to human readable format. For example, 1126 bytes will be converted to the string
+     * {@code 1.1 KiB}
+     * @param bytes the number of bytes to display
+     * @param si whether to use standard international units (base 2) (kibibyte, mebibyte, gibibyte, etc.) or colloquial
+     *           ones (base 10) (kilobyte, megabyte, gigabyte, etc.)
+     * @return a human readable string
+     */
     public static String humanReadableByteCount(long bytes, boolean si) {
         int unit = si ? 1000 : 1024;
         if (bytes < unit) return bytes + " B";
@@ -209,12 +260,20 @@ public class Server {
         return String.format("%.1f %sB", bytes / Math.pow(unit, exp), pre);
     }
 
+    /**
+     * Helper method to read a stream of text.
+     * @param in the stream to read the text from
+     */
     private void readText(InputStream in) {
         Scanner s = new Scanner(in);
         s.useDelimiter("\\z");
         displayText(s.next());
     }
 
+    /**
+     * Helper method to display the text read from the stream in an alert dialog.
+     * @param text text to be displayed
+     */
     private void displayText(String text) {
         Platform.runLater(() -> {
             new AlertBuilder(Alert.AlertType.INFORMATION)
@@ -233,6 +292,12 @@ public class Server {
         }
     }
 
+    /**
+     * Send a text to the specified host with a specified code.
+     * @param host the remote host (also running JDrop) to send the text to
+     * @param code the code for verification
+     * @param text the text to be sent
+     */
     void sendText(String host, String code, String text) {
         try {
             LOG.log(Level.INFO, "Connecting to " + host + ":" + DEFAULT_PORT);
@@ -248,6 +313,12 @@ public class Server {
         }
     }
 
+    /**
+     * Send a file to the specified host with a specified code.
+     * @param host the remote host (also running JDrop) to send the text to
+     * @param code the code for verification
+     * @param file the file to be sent
+     */
     void sendFile(String host, String code, File file) {
         try {
             FileInputStream in = new FileInputStream(file);
@@ -266,6 +337,12 @@ public class Server {
         }
     }
 
+    /**
+     * Helper method to write the file to the stream.
+     * @param in input stream to read the file from local filesystem
+     * @param out remote output stream to write the output file
+     * @return the number of bytes written to the stream
+     */
     private long writeFile(InputStream in, OutputStream out) {
         long counter = 0;
         byte[] buffer = new byte[DEFAULT_CHUNK];
@@ -285,6 +362,10 @@ public class Server {
         int code = random.nextInt(1000000);
         Platform.runLater(() -> Server.this.code.setValue(String.format("%06d", code)));
         LOG.log(Level.INFO, "New Code=" + this.code.get());
+    }
+
+    public void interrupt() {
+        serverThread.interrupt();
     }
 
     public String getCode() {
